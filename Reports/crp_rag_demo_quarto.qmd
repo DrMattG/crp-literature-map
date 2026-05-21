@@ -281,8 +281,6 @@ ragnar_register_tool_retrieve(chat, store)
 
 ## Example chatbot responses
 
-These chunks can be run live during the demonstration.
-
 ### Example 1: Broad mapping question
 
 ```{r}
