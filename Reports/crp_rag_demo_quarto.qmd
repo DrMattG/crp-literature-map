@@ -1,0 +1,578 @@
+---
+title: "A simple RAG demo using OpenAlex titles and abstracts"
+subtitle: "Exploring Conservation Reserve Program literature with ragnar and ellmer"
+author: "Matt Grainger"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: cosmo
+editor: visual
+execute:
+  echo: true
+  eval: false
+  warning: false
+  message: false
+---
+
+## Purpose
+
+This short demonstration shows how we can build a simple retrieval-augmented generation (RAG) workflow from a large JSON file containing bibliographic records.
+
+The example uses records from OpenAlex relating to the **Conservation Reserve Program**. Each record contains a title, abstract, DOI, publication year and journal. The aim is not to create a definitive evidence synthesis, but to demonstrate how RAG can help us explore a large body of literature.
+
+Important caveat: this workflow uses **titles and abstracts only**. The chatbot should therefore be treated as a literature exploration and evidence mapping assistant, not as a full systematic review or full-text evidence synthesis tool.
+
+## Setup
+
+You will need the following R packages.
+
+```{r}
+# install.packages(c(
+#   "jsonlite",
+#   "dplyr",
+#   "stringr",
+#   "ragnar",
+#   "ellmer",
+#   "vctrs"
+# ))
+
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(ragnar)
+library(ellmer)
+library(vctrs)
+```
+
+You also need an OpenAI API key available to R. One common option is to set it in `.Renviron`:
+
+```{r, eval=FALSE}
+OPENAI_API_KEY="your-key-here"
+```
+
+Then restart R.
+
+## Load the JSON file
+
+The JSON file is expected to contain a top-level object called `records`.
+
+```{r}
+raw <- fromJSON("crp_openalex_enhanced.json")
+
+records <- raw$records
+
+glimpse(records)
+```
+
+## Prepare the records
+
+We keep only the fields needed for retrieval and citation.
+
+```{r}
+docs <- records |>
+  transmute(
+    id = as.character(id),
+    doi = as.character(doi),
+    title = as.character(title),
+    abstract = as.character(abstract),
+    year = as.integer(publication_year),
+    journal = as.character(journal)
+  ) |>
+  filter(
+    !is.na(title),
+    !is.na(abstract),
+    abstract != ""
+  )
+
+nrow(docs)
+```
+
+## Helper function for cleaning text
+
+Some OpenAlex records contain unusual spacing, encoding artefacts, or hidden control characters. This helper function makes the text safer to send to the embedding model.
+
+```{r}
+#' Clean text before embedding
+#'
+#' Converts text to UTF-8, removes non-printing characters, removes control
+#' characters, and squishes repeated whitespace.
+#'
+#' @param x A character vector.
+#'
+#' @return A cleaned character vector.
+clean_text <- function(x) {
+  x |>
+    as.character() |>
+    iconv(from = "", to = "UTF-8", sub = " ") |>
+    str_replace_all("[^[:print:]\n\r\t]", " ") |>
+    str_replace_all("[[:cntrl:]]", " ") |>
+    str_squish()
+}
+```
+
+## Create chunks for RAG
+
+For this demonstration, each title and abstract becomes one retrieval unit.
+
+For full-text documents we would usually chunk the text more carefully. For abstracts, keeping one record as one chunk is usually sufficient.
+
+```{r}
+chunks_rag <- docs |>
+  transmute(
+    id = id,
+    doi = if_else(is.na(doi), "", doi),
+    title = clean_text(title),
+    year = year,
+    journal = if_else(is.na(journal), "", clean_text(journal)),
+    abstract = clean_text(abstract),
+    text = str_glue("{title}\n\n{abstract}")
+  ) |>
+  filter(
+    !is.na(text),
+    text != "",
+    nchar(text) > 20
+  ) |>
+  mutate(
+    # Keeps the embedding requests manageable.
+    # This is usually enough for titles and abstracts.
+    text = str_sub(text, 1, 6000)
+  )
+
+glimpse(chunks_rag)
+```
+
+## Create the ragnar store
+
+This creates a DuckDB-backed vector store. We use OpenAI's `text-embedding-3-small` model for embeddings.
+
+```{r}
+store <- ragnar_store_create(
+  "crp_abstracts.duckdb",
+  embed = \(x) embed_openai(x, model = "text-embedding-3-small"),
+  extra_cols = vctrs::vec_ptype(chunks_rag),
+  version = 1,
+  overwrite = TRUE
+)
+```
+
+## Insert records in small batches
+
+With thousands of abstracts, inserting everything at once can create embedding requests that are too large. Batching makes the process more reliable.
+
+```{r}
+#' Insert chunks into a ragnar store in batches
+#'
+#' This avoids sending too many texts to the embedding API in one request.
+#'
+#' @param store A ragnar store object created with `ragnar_store_create()`.
+#' @param chunks A data frame containing a `text` column and metadata columns.
+#' @param batch_size Number of records to insert per batch.
+#'
+#' @return Invisibly returns `NULL`.
+insert_in_batches <- function(store, chunks, batch_size = 50) {
+  for (i in seq(1, nrow(chunks), by = batch_size)) {
+    j <- min(i + batch_size - 1, nrow(chunks))
+
+    message("Inserting rows ", i, " to ", j)
+
+    ragnar_store_insert(
+      store,
+      chunks[i:j, ]
+    )
+  }
+
+  invisible(NULL)
+}
+
+insert_in_batches(store, chunks_rag, batch_size = 50)
+```
+
+## Build the retrieval index
+
+```{r}
+ragnar_store_build_index(store)
+```
+
+## Test retrieval directly
+
+Before adding a chatbot layer, it is useful to check whether retrieval is returning sensible records.
+
+```{r}
+ragnar_retrieve(
+  store,
+  "What evidence is there that the Conservation Reserve Program reduces nitrate losses?",
+  top_k = 10
+) |>
+  select(title, year, journal, doi)
+```
+
+```{text}
+# A tibble: 20 × 5   
+   title                                                                  year journal doi   text 
+   <chr>                                                                 <int> <chr>   <chr> <chr>
+ 1 Groundwater Nitrate Concentration Reductions in a Riparian Buffer En.  2014 "JAWRA. "htt. "Gro.
+ 2 Nitrate Removal of Riparian Buffers Established Through the NC Conse.  2006 "2006 . "htt. "Nit.
+ 3 Restoring Wetlands for Nitrate Removal from Subsurface Drainage: Res.  2013 ""      "htt. "Res.
+ 4 Nitrogen Dynamics Affected by Management Practices in Croplands Tran.  2014 "Agron. "htt. "Nit.
+ 5 Ecological Benefits of the Conservation Reserve Program                1993 "Conse. "htt. "Eco.
+ 6 Nitrate Losses through Subsurface Tile Drainage in Conservation Rese.  1997 "Journ. "htt. "Nit.
+ 7 Hydrological impacts of the conservation reserve program-a mini revi.  2024 "Front. "htt. "Hyd.
+ 8 Conservation Reserve Program effects on soil quality indicators        1999 "Journ. "htt. "Con.
+ 9 Groundwater nitrate reduction processes in a riparian buffer enrolle.  2010 "2010 . "htt. "Gro.
+10 Water Quality Benefits from the Conservation Reserve Program           1989 ""      ""    "Wat.
+11 JAWRA: Fifty-Five Years of Sustained Contributions for Improved Wate.  2019 "JAWRA. "htt. "JAW.
+12 Étude sur la mise en ouvre d'outils d'écofiscalité au service de la .  2023 ""      "htt. "Étu.
+13 Étude sur la mise en ouvre d'outils d'écofiscalité au service de la .  2023 ""      "htt. "Étu.
+14 Management plan and conservation strategies for sage grouse in Monta.  2005 ""      "htt. "Man.
+15 Adaptive management in native grasslands managed by the U.S. Fish an.  2018 "Antar. "htt. "Ada.
+16 ECONOMIC AND STOCHASTIC EFFICIENCY COMPARISON OF EXPERIMENTAL TILLAG.  2011 "Exper. "htt. "ECO.
+17 SWITCHGRASS POTENTIAL ON RECLAIMED SURFACE MINES FOR BIOFUEL PRODUCT.  2012 "Recla. "htt. "SWI.
+18 Switchgrass potential on reclaimed surface mines for biofuel product.  2012 ""      "htt. "Swi.
+19 Management and research applications of long-range surveillance rada.  2008 "Fact . "htt. "Man.
+20 Hydrostratigraphic interpretation of test-hole and borehole geophysi.  2014 "Antar. "htt. "Hyd.
+```
+
+## Example retrieval questions
+
+```{r}
+queries <- c(
+  "biodiversity benefits of conservation reserve program",
+  "water quality nitrate runoff tile drainage",
+  "land use change slippage effects",
+  "economic evaluation conservation reserve program",
+  "soil organic carbon storage conservation reserve program",
+  "grassland bird responses conservation reserve program"
+)
+
+retrieval_examples <- lapply(queries, \(q) {
+  ragnar_retrieve(store, q, top_k = 5) |>
+    select(title, year, journal, doi)
+})
+
+names(retrieval_examples) <- queries
+
+retrieval_examples
+```
+
+## Create a chatbot
+
+The system prompt is deliberately cautious. The model is told that it is using titles and abstracts, not full texts.
+
+```{r}
+chat <- chat_openai(
+  model = "gpt-4.1",
+  system_prompt = "
+You answer questions using retrieved titles and abstracts.
+
+Important constraints:
+- You are using titles and abstracts, not full texts.
+- Do not overstate the strength of evidence.
+- Cite the title, year, journal and DOI where possible.
+- If the retrieved evidence is weak, mixed, or irrelevant, say so.
+- If the question cannot be answered from the retrieved abstracts, say so clearly.
+"
+)
+
+ragnar_register_tool_retrieve(chat, store)
+```
+
+## Example chatbot responses
+
+These chunks can be run live during the demonstration.
+
+### Example 1: Broad mapping question
+
+```{r}
+chat$chat(
+  "What are the main themes in this literature on the Conservation Reserve Program?"
+)
+```
+
+```{text}
+The literature on the Conservation Reserve Program (CRP) centers on several main themes:
+
+1. **Program Structure and Purpose**: The CRP, established in 1985, is designed to retire highly 
+erodible or environmentally sensitive cropland, typically through 10-year contracts. The goal is 
+to conserve soil and water resources, and participants receive rental payments, cost-sharing, and
+technical assistance to establish approved plantings (see "Conservation Reserve Program: Status 
+and Policy Issues," 1997; "Conservation Reserve Program: Status and Current Issues," 2005).
+
+2. **Land Retirements and Environmental Benefits**: The CRP is the largest federal land 
+retirement program, reducing active farming on marginal lands to facilitate ecosystem recovery 
+and environmental benefits such as improved water quality, reduced soil erosion, and enhanced 
+wildlife habitat (see above titles).
+
+3. **Biodiversity and Wildlife**: The program influences wildlife, especially grassland birds and
+pollinators. For example, integrating prairie strips in crop fields can increase pollinator and 
+bird abundance, as well as affect nutrient and sediment runoff ("Assessing the effects of 
+embedding prairie strips within row crop fields on soil hydraulic properties and soil health," 
+2022).
+
+4. **Soil Health and Water Quality**: Studies assess how conservation measures like prairie 
+strips impact soil hydraulic properties, wet-aggregate stability, runoff, and overall soil 
+health. These effects, however, may vary across site conditions and soil history.
+
+5. **Policy and Administration**: The CRP is administered by the USDA's Farm Service Agency, with
+technical support from the Natural Resources Conservation Service. Policy issues include 
+enrollment caps, eligibility, and the design of incentive structures.
+
+6. **Management of Native and Exotic Grasslands**: Research compares bird and plant diversity, as
+well as ecosystem processes, in native versus exotic grasslands-much of which overlaps with CRP 
+incentive areas and management strategies for retired farmland ("Grassland birds wintering at 
+U.S. Navy facilities in southern Texas," 2010).
+
+7. **Societal Perceptions and Adoption**: Perception among farmers and the broader public about 
+the value and implementation of CRP and related conservation practices like prairie strips can 
+affect program participation and success.
+
+In summary, themes cover program operations and policy, environmental and biodiversity outcomes, 
+impacts on soil and water, comparison of native vs. restored plant communities, and the social 
+dynamics influencing program adoption.
+
+**Key Sources**:
+- "Conservation Reserve Program: Status and Policy Issues," 1997.
+- "Conservation Reserve Program: Status and Current Issues," 2005.
+- "Assessing the effects of embedding prairie strips within row crop fields on soil hydraulic 
+properties and soil health," 2022. https://doi.org/10.31274/td-20240329-92
+- "Grassland birds wintering at U.S. Navy facilities in southern Texas," 2010. 
+https://doi.org/10.3133/ofr20101115
+
+(The evidence for some themes, like biodiversity and soil health impacts, is robust; however, 
+more specific studies may exist if detailed subtopics are of interest.)
+```
+
+### Example 2: Specific environmental outcome
+
+```{r}
+chat$chat(
+  "What evidence is there that the Conservation Reserve Program improves water quality or reduces nitrate losses?"
+)
+```
+
+```{text}
+There is direct evidence that the Conservation Reserve Program (CRP), particularly through its 
+establishment of riparian buffers, can significantly reduce nitrate losses and improve water 
+quality:
+
+1. **Groundwater Nitrate Reduction**:
+   - A study of a 46-meter-wide riparian buffer enrolled in the North Carolina Conservation 
+Reserve Enhancement Program (NC CREP, a state-level version of CRP) found that groundwater 
+nitrate-nitrogen concentrations were reduced by 76-92% across the buffer. This reduction was 
+observed in all monitored sections and was attributed to a combination of denitrification, plant 
+uptake, and dilution processes. Chloride reductions (48-65%) helped demonstrate that dilution was
+a contributing factor, but biological processes played a key role as well ("Groundwater Nitrate 
+Concentration Reductions in a Riparian Buffer Enrolled in the NC Conservation Reserve Enhancement
+Program," JAWRA Journal of the American Water Resources Association, 2014, 
+https://doi.org/10.1111/jawr.12209).
+
+2. **Effectiveness of Forested Riparian Buffers**:
+   - Two forested riparian buffers established under the NC CREP were monitored. Groundwater 
+nitrate levels were dramatically reduced as water moved from the agricultural field edge to the 
+stream edge (from averages of 8.1 mg/L and 4.1 mg/L down to 1.3 mg/L and 1.6 mg/L in shallow 
+wells). This study concluded that these buffers significantly reduced nitrate loads in 
+groundwater before reaching streams, likely limiting further increases in stream nitrate 
+concentrations ("Nitrate Removal of Riparian Buffers Established Through the NC Conservation 
+Reserve Enhancement Program," 2006, https://doi.org/10.13031/2013.21438).
+
+3. **Longitudinal Monitoring**:
+   - Over several years, buffers of multiple vegetation zones (hardwood, pine, grass) enrolled in
+the NC CREP were monitored for nitrate in groundwater and adjacent streams. The studies 
+consistently found significant reductions in nitrate concentrations in groundwater as it passed 
+through the buffer, reinforcing the buffer's water quality benefits ("Groundwater nitrate 
+reduction processes in a riparian buffer enrolled in the NC Conservation Reserve Enhancement 
+Program," 2010, https://doi.org/10.13031/2013.29893).
+
+**Summary:** Riparian buffers established via the Conservation Reserve Program or similar 
+programs have been shown to reduce nitrate concentrations in groundwater by significant margins 
+(often 75% or more). These reductions help prevent agricultural nitrate from reaching streams and
+water bodies, improving overall water quality. The main mechanisms are plant uptake, microbial 
+denitrification, and dilution. The effect is most pronounced in groundwater; impact on stream 
+concentrations depends on specific site conditions.
+
+**References:**
+- Deal, N.E., et al. (2014). Groundwater Nitrate Concentration Reductions in a Riparian Buffer 
+Enrolled in the NC Conservation Reserve Enhancement Program. *JAWRA J Am Water Resour Assoc*, 
+50(3), 653-664. https://doi.org/10.1111/jawr.12209
+- Evans, R.O., et al. (2006). Nitrate Removal of Riparian Buffers Established Through the NC 
+Conservation Reserve Enhancement Program. https://doi.org/10.13031/2013.21438
+- Deal, N.E., et al. (2010). Groundwater nitrate reduction processes in a riparian buffer 
+enrolled in the NC Conservation Reserve Enhancement Program. https://doi.org/10.13031/2013.29893
+
+These findings are robust for riparian (streamside) buffer practices funded under CRP/CREP, 
+particularly in the context of North Carolina, but the principle is generalizable to other 
+regions using similar conservation buffers.
+```
+
+### Example 3: Biodiversity question
+
+```{r}
+chat$chat(
+  "What does this literature suggest about the effects of the Conservation Reserve Program on grassland birds?"
+)
+```
+
+```{text}
+The literature indicates that the Conservation Reserve Program (CRP) generally has positive 
+effects on grassland birds:
+
+1. **Habitat Creation and Bird Diversity**  
+CRP fields, through land retirement and restoration of native or perennial vegetation, provide 
+crucial habitat for grassland birds-many of which have declined due to conversion of grassland to
+croplands. The presence of CRP lands has been associated with increased abundance and diversity 
+of grassland birds compared to intensively farmed or exotic grass-dominated lands.
+
+2. **Comparison of Native and Exotic Grasslands**  
+Studies comparing native and exotic (non-native) grasslands, often in the context of CRP 
+habitats, found native grasslands consistently support greater bird species richness than exotic 
+grasslands. However, some exotic grasslands enrolled in CRP can have higher total numbers of 
+certain bird species in some years ("Grassland birds wintering at U.S. Navy facilities in 
+southern Texas," Antarctica A Keystone in a Changing World, 2010, 
+https://doi.org/10.3133/ofr20101115).
+
+3. **Conservation of At-risk or Declining Species**  
+CRP lands are important for supporting populations of several declining grassland bird species, 
+including species of conservation concern such as Le Conte's Sparrow, Grasshopper Sparrow, and 
+Loggerhead Shrike. Seven species observed in CRP-associated studies were listed as of 
+conservation concern, and most common birds detected were grassland species (same source above).
+
+4. **Vegetation Complexity and Bird Use**  
+Species richness and bird abundance in CRP lands are related to the type and complexity of 
+vegetation cover. Native vegetation generally supports a higher diversity of birds, while 
+management practices (e.g., mowing, burning, rest) also affect which bird species are present.
+
+5. **Seasonal Use and Migratory Birds**  
+CRP fields are not only breeding habitat but are also important for overwintering and migratory 
+grassland birds, offering food sources and shelter during critical times ("Grassland birds 
+wintering at U.S. Navy facilities in southern Texas," 2010).
+
+**Summary:**  
+The evidence from CRP-related studies is robust in demonstrating that the program provides 
+essential habitat and supports higher diversity and abundance of grassland birds, including many 
+at-risk species. Outcomes tend to be most favorable in CRP fields restored to native vegetation, 
+but even managed exotic grasslands under CRP offer benefits over conventional agricultural 
+fields.
+
+**Key Reference:**
+- "Grassland birds wintering at U.S. Navy facilities in southern Texas," Antarctica A Keystone in
+a Changing World, 2010. https://doi.org/10.3133/ofr20101115
+
+If you need evidence for particular bird species or want more detail on management practices, I 
+can search for additional targeted studies.
+```
+
+### Example 4: Evidence gaps
+
+```{r}
+chat$chat(
+  "Based on the retrieved abstracts, what appear to be important evidence gaps or under-studied questions?"
+)
+```
+
+```{text}
+Based on the retrieved abstracts, several important evidence gaps and under-studied questions in 
+the Conservation Reserve Program (CRP) literature are apparent:
+
+### 1. **Long-term Water Quality Outcomes for Streams**
+- While several studies show CRP-associated riparian buffers significantly reduce nitrate in 
+groundwater before it enters streams, results for streamwater nitrate concentrations are less 
+clear. One study even notes that "both buffered streams showed increased levels in nitrate 
+concentration downstream of the buffers," suggesting that groundwater improvement may not always 
+translate to immediate stream improvements (Evans et al., 2006).  
+- **Gap:** There is a need for more long-term, watershed-scale studies documenting how and when 
+groundwater nitrate reductions from CRP practices result in measurable improvements in stream 
+water quality.
+
+### 2. **Causal Mechanisms of Nitrate Reduction**
+- The studies found that nitrate reductions in groundwater could be due to a mix of 
+denitrification, plant uptake, and dilution, with the precise contribution of each process 
+unclear.  
+- **Gap:** More research is needed to quantify the relative importance of biotic (e.g., 
+denitrification, plant uptake) versus abiotic (e.g., dilution) processes in different settings to
+better predict performance and assign nitrogen removal credits.
+
+### 3. **Impacts on Soil Health and Productivity**
+- Recent work on prairie strips in croplands notes that effects on soil health are "not 
+definitively greater in prairie strips than row crops across sites at the current establishment 
+stage." Most marked improvements are in wet-aggregate stability, but broader, longer-term impacts
+on overall productivity and nutrient cycling remain uncertain ("Assessing the effects of 
+embedding prairie strips within row crop fields...", 2022).
+- **Gap:** More studies spanning longer timeframes, different soil types, and climates are needed
+to fully understand the impacts of CRP practices on soil health and agricultural productivity.
+
+### 4. **Wildlife Responses-Beyond Birds**
+- While there is substantial information on grassland birds, less is known about the response of 
+other wildlife (e.g., mammals, insects, reptiles) to CRP practices. Even within bird studies, 
+most focus on North American breeding birds, with wintering birds ("Grassland birds wintering at 
+U.S. Navy facilities in southern Texas," 2010) and migrating species less studied.
+- **Gap:** Comprehensive assessments of the effects of CRP on a wider spectrum of wildlife and 
+across seasons are needed.
+
+### 5. **Relative Effectiveness of Native vs. Exotic Vegetation**
+- Research consistently shows higher bird species richness in native grasslands compared to 
+exotic ones, but there are still years and situations where exotic grasslands support higher bird
+abundance.
+- **Gap:** There is a need for nuanced, species- and context-specific comparisons to determine 
+which wildlife and ecosystem services benefit most from native versus exotic vegetation types 
+under CRP.
+
+### 6. **Socioeconomic and Adoption Factors**
+- One abstract notes the "favorable perception in farming and nonfarming populations" for prairie
+strips but does not delve deeply into adoption rates, barriers, or economic returns for farmers.
+- **Gap:** More detailed, empirical studies on economic outcomes, management trade-offs, and 
+farmer decision-making could help optimize enrollment and design of CRP practices.
+
+### 7. **Landscape and Management Context**
+- Existing studies often focus on individual sites or small-scale setups. There is limited 
+discussion on how landscape context, adjacent land use, and specific management practices (e.g., 
+grazing, burning, mowing) interact with CRP outcomes.
+- **Gap:** More landscape-scale, multi-factor studies are needed to inform best practices for CRP
+implementation and adaptive management.
+
+---
+
+**In summary:**  
+While the CRP literature shows strong benefits for water quality (mainly in groundwater), 
+grassland birds, and potentially soil health, it is often site-specific and outcome-specific. 
+There are clear evidence gaps related to causal mechanisms, multi-scale (especially stream and 
+landscape scale) impacts, effects on a wider array of wildlife, native versus exotic vegetation 
+benefits, socioeconomic factors, and best management practices. These represent important areas 
+for future research to maximize the effectiveness and resilience of CRP and similar conservation 
+programs.
+
+```
+
+## Workflow:
+
+1.  We start with a large bibliographic dataset that is too large to inspect manually.
+2.  We convert each title and abstract into a searchable text unit.
+3.  We embed those text units, meaning that records can be retrieved by semantic similarity rather than exact keyword matching.
+4.  We first test retrieval directly, which is important for quality control.
+5.  We then connect the retrieval system to a chatbot.
+6.  The chatbot is instructed to answer cautiously because it only has access to titles and abstracts.
+
+The key principle is that the language model is not being asked to answer from memory. It is being asked to answer using retrieved records from a defined corpus.
+
+## Important limitations
+
+This should be framed as a **literature exploration tool**, not a replacement for systematic review judgement.
+
+Limitations include:
+
+- The chatbot only sees titles and abstracts.
+- Important methodological details may be absent from abstracts.
+- Retrieval may miss relevant records if the query is poorly phrased.
+- The language model may still over-generalise if not prompted carefully.
+- The results should be checked against the retrieved records.
+- This is useful for scoping, mapping, question refinement and screening support, but not for final evidence claims.
+
+## Possible next steps
+
+Useful extensions could include:
+
+- adding topic codes or evidence map categories;
+- clustering abstracts by theme;
+- developing a Shiny (interactive html) interface;
+- adding full texts where licences and access allow.
